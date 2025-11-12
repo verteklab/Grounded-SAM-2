@@ -27,7 +27,10 @@ from torch.nn.init import constant_, xavier_uniform_
 
 try:
     from grounding_dino.groundingdino import _C
+    _C_AVAILABLE = True
 except:
+    _C = None
+    _C_AVAILABLE = False
     warnings.warn("Failed to load custom C++ ops. Running on CPU mode Only!")
 
 
@@ -50,14 +53,20 @@ class MultiScaleDeformableAttnFunction(Function):
         im2col_step,
     ):
         ctx.im2col_step = im2col_step
-        output = _C.ms_deform_attn_forward(
-            value,
-            value_spatial_shapes,
-            value_level_start_index,
-            sampling_locations,
-            attention_weights,
-            ctx.im2col_step,
-        )
+        if _C_AVAILABLE and _C is not None:
+            output = _C.ms_deform_attn_forward(
+                value,
+                value_spatial_shapes,
+                value_level_start_index,
+                sampling_locations,
+                attention_weights,
+                ctx.im2col_step,
+            )
+        else:
+            # Fallback to PyTorch implementation
+            output = multi_scale_deformable_attn_pytorch(
+                value, value_spatial_shapes, sampling_locations, attention_weights
+            )
         ctx.save_for_backward(
             value,
             value_spatial_shapes,
@@ -77,15 +86,23 @@ class MultiScaleDeformableAttnFunction(Function):
             sampling_locations,
             attention_weights,
         ) = ctx.saved_tensors
-        grad_value, grad_sampling_loc, grad_attn_weight = _C.ms_deform_attn_backward(
-            value,
-            value_spatial_shapes,
-            value_level_start_index,
-            sampling_locations,
-            attention_weights,
-            grad_output,
-            ctx.im2col_step,
-        )
+        if _C_AVAILABLE and _C is not None:
+            grad_value, grad_sampling_loc, grad_attn_weight = _C.ms_deform_attn_backward(
+                value,
+                value_spatial_shapes,
+                value_level_start_index,
+                sampling_locations,
+                attention_weights,
+                grad_output,
+                ctx.im2col_step,
+            )
+        else:
+            # Fallback: return None gradients (not ideal but allows forward pass)
+            # In practice, this means training won't work without _C, but inference will
+            warnings.warn("Backward pass not supported without C++ ops. Gradients will be None.")
+            grad_value = None
+            grad_sampling_loc = None
+            grad_attn_weight = None
 
         return grad_value, None, None, grad_sampling_loc, grad_attn_weight, None
 

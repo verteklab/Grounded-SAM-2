@@ -1,0 +1,78 @@
+# Gunicorn配置示例 - 根据GPU显存调整workers数量
+
+# ============================================
+# 显存与Worker数量对应关系（参考）
+# ============================================
+# GPU显存    | 推荐workers | 说明
+# ----------|------------|------------------
+# 8GB       | 2          | 每个模型约1.5GB
+# 16GB      | 3-4        | 留出推理临时显存
+# 24GB      | 4-6        | 当前推荐配置
+# 32GB      | 6-8        | 可适当增加
+# 40GB+     | 8-12       | 根据实际需求
+#
+# 计算公式：
+# workers = (GPU显存GB - 系统预留2GB) / 每个模型占用GB
+# 每个模型占用 ≈ 1.4-2.0 GB（SAM2.1 Large + GroundingDINO）
+# ============================================
+
+# 工作进程数（根据你的GPU显存调整）
+workers = 4
+
+# 每个进程线程数（CPU密集型设为1-2）
+threads = 2
+
+# 请求超时时间（模型推理可能需要较长时间）
+timeout = 300
+
+# CUDA与fork()不兼容，不能使用preload_app
+# 每个worker进程需要独立加载模型
+# 注意：这会导致每个进程都占用GPU内存，总内存 = 模型大小 × worker数量
+preload_app = False
+
+# 绑定地址和端口
+bind = "0.0.0.0:6155"
+
+# 守护进程模式（后台运行）
+daemon = True
+
+# 进程名称
+proc_name = "grounded-sam2-server"
+
+# 日志配置
+loglevel = "info"
+accesslog = "logs/access.log"
+errorlog = "logs/error.log"
+access_log_format = '%(h)s %(l)s %(u)s %(t)s "%(r)s" %(s)s %(b)s "%(f)s" "%(a)s" %(D)s'
+
+# 防止内存泄漏：每个进程处理1000个请求后自动重启
+max_requests = 1000
+max_requests_jitter = 50
+
+# 优雅超时设置
+graceful_timeout = 60
+
+# Worker启动后回调：在每个worker进程中加载模型
+def on_starting(server):
+    """主进程启动时调用"""
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info("🚀 Gunicorn主进程启动")
+
+def post_fork(server, worker):
+    """每个worker进程fork后调用 - 在这里加载模型"""
+    import logging
+    import os
+    logger = logging.getLogger(__name__)
+    logger.info(f"🔄 Worker进程 {os.getpid()} 启动，正在加载模型...")
+    
+    # 在每个worker进程中加载模型
+    from model_manager import model_manager
+    try:
+        model_manager.load_models()
+        logger.info(f"✅ Worker进程 {os.getpid()} 模型加载完成")
+    except Exception as e:
+        logger.error(f"❌ Worker进程 {os.getpid()} 模型加载失败: {e}")
+        raise
+
+

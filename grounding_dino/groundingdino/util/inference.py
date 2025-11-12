@@ -1,4 +1,6 @@
 from typing import Tuple, List
+from io import BytesIO
+import base64
 
 import cv2
 import numpy as np
@@ -7,6 +9,7 @@ import torch
 from PIL import Image
 from torchvision.ops import box_convert
 import bisect
+import requests
 
 import grounding_dino.groundingdino.datasets.transforms as T
 from grounding_dino.groundingdino.models import build_model
@@ -49,6 +52,36 @@ def load_image(image_path: str) -> Tuple[np.array, torch.Tensor]:
     image_transformed, _ = transform(image_source, None)
     return image, image_transformed
 
+def load_image_from_url(url: str) -> Tuple[np.array, torch.Tensor]:
+    transform = T.Compose(
+        [
+            T.Resize([800], max_size=1333),
+            T.ToTensor(),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]
+    )
+    resp = requests.get(url)
+    resp.raise_for_status()
+    image_source = Image.open(BytesIO(resp.content)).convert("RGB")
+    image = np.asarray(image_source)
+    image_transformed, _ = transform(image_source, None)
+    return image, image_transformed
+
+def load_image_from_base64(base64_str: str) -> Tuple[np.array, torch.Tensor]:
+    transform = T.Compose(
+        [
+            T.Resize([800], max_size=1333),
+            T.ToTensor(),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]
+    )
+    if ',' in base64_str:
+        base64_str = base64_str.split(',')[1]
+    image_data = base64.b64decode(base64_str)
+    image_source = Image.open(BytesIO(image_data)).convert("RGB")
+    image = np.asarray(image_source)
+    image_transformed, _ = transform(image_source, None)
+    return image, image_transformed
 
 def predict(
         model,

@@ -223,6 +223,19 @@ class RandomHorizontalFlip(object):
         return img, target
 
 
+class Resize(object):
+    """Resize transform that uses a fixed size (not random)"""
+    def __init__(self, sizes, max_size=None):
+        assert isinstance(sizes, (list, tuple))
+        self.sizes = sizes
+        self.max_size = max_size
+
+    def __call__(self, img, target=None):
+        # Use the first size if sizes is a list, or the size directly if it's a single value
+        size = self.sizes[0] if isinstance(self.sizes, (list, tuple)) else self.sizes
+        return resize(img, target, size, self.max_size)
+
+
 class RandomResize(object):
     def __init__(self, sizes, max_size=None):
         assert isinstance(sizes, (list, tuple))
