@@ -8,26 +8,33 @@ import time    # 时间戳
 import uuid    # 请求ID生成
 import threading  # 线程信息
 import traceback  # 异常追踪
+import json    # JSON处理
 from datetime import datetime
 from pathlib import Path
 from model_manager import model_manager
 
-# 创建logs目录
-logs_dir = Path(__file__).parent / "logs"
-logs_dir.mkdir(exist_ok=True)
+# 创建logs目录（支持通过环境变量配置）
+logs_dir = Path(os.getenv('LOG_DIR', Path(__file__).parent / "logs"))
+logs_dir.mkdir(parents=True, exist_ok=True)
 
 # 配置详细的日志系统
 # 使用RotatingFileHandler支持日志轮转（每个文件10MB，保留5个备份）
+# 支持通过环境变量配置日志参数
+log_max_bytes = int(os.getenv('LOG_MAX_BYTES', '10485760'))  # 默认10MB
+log_backup_count = int(os.getenv('LOG_BACKUP_COUNT', '5'))
+log_level_str = os.getenv('LOG_LEVEL', 'INFO')
+log_level = getattr(logging, log_level_str.upper(), logging.INFO)
+
 file_handler = RotatingFileHandler(
     logs_dir / "app.log",
-    maxBytes=10*1024*1024,  # 10MB
-    backupCount=5,
+    maxBytes=log_max_bytes,
+    backupCount=log_backup_count,
     encoding='utf-8'
 )
-file_handler.setLevel(logging.INFO)
+file_handler.setLevel(log_level)
 
 console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
+console_handler.setLevel(log_level)
 
 # 统一的日志格式
 formatter = logging.Formatter(
@@ -39,12 +46,53 @@ console_handler.setFormatter(formatter)
 
 # 配置根日志记录器
 root_logger = logging.getLogger()
-root_logger.setLevel(logging.INFO)
+root_logger.setLevel(log_level)
 root_logger.addHandler(file_handler)
 root_logger.addHandler(console_handler)
 
 # 获取应用日志记录器
 logger = logging.getLogger(__name__)
+
+def save_request_params(request_id, text_prompt, box_threshold, text_threshold, epsilon, base64_str):
+    """
+    保存请求参数到文件
+    
+    Args:
+        request_id: 请求ID
+        text_prompt: 文本提示
+        box_threshold: 检测框阈值
+        text_threshold: 文本匹配阈值
+        epsilon: 多边形简化精度参数
+        base64_str: base64编码的图像字符串（只保存长度，不保存完整内容）
+    """
+    try:
+        # 创建参数保存目录
+        params_dir = Path(__file__).parent / "logs" / "request_params"
+        params_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 构建参数数据
+        params_data = {
+            "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+            "request_id": request_id,
+            "text_prompt": text_prompt,
+            "box_threshold": box_threshold,
+            "text_threshold": text_threshold,
+            "epsilon": epsilon,
+            "base64_length": len(base64_str) if base64_str else 0,
+            "base64_preview": base64_str[:100] + "..." if base64_str and len(base64_str) > 100 else base64_str  # 只保存前100个字符作为预览
+        }
+        
+        # 保存到JSON文件
+        timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
+        params_file = params_dir / f"params_{request_id}_{timestamp_str}.json"
+        
+        with open(params_file, 'w', encoding='utf-8') as f:
+            json.dump(params_data, f, indent=2, ensure_ascii=False)
+        
+        logger.info(f"[{request_id}] 💾 请求参数已保存到: {params_file}")
+        
+    except Exception as e:
+        logger.warning(f"[{request_id}] 保存参数失败: {e}")
 
 app = Flask(__name__)
 
@@ -73,6 +121,7 @@ def before_request():
     g.request_id = str(uuid.uuid4())[:8]
     g.start_time = time.time()
     g.thread_id = threading.current_thread().ident
+    g.worker_id = os.getpid()  # 记录worker进程ID
     
     # 记录请求信息
     logger.info(
@@ -80,7 +129,7 @@ def before_request():
         f"Method={request.method} | "
         f"Path={request.path} | "
         f"Remote={request.remote_addr} | "
-        f"PID={os.getpid()} | "
+        f"PID={g.worker_id} | "
         f"TID={g.thread_id} | "
         f"User-Agent={request.headers.get('User-Agent', 'N/A')[:50]}"
     )
@@ -93,7 +142,7 @@ def before_request():
 def after_request(response):
     """请求后处理：记录响应信息和耗时"""
     # 计算处理时间
-    duration = time.time() - g.start_time
+    duration = time.time() - g.start_time if hasattr(g, 'start_time') else 0
     
     # 获取响应大小
     response_size = len(response.get_data()) if hasattr(response, 'get_data') else 0
@@ -175,19 +224,23 @@ def inference():
     
     try:
         # 获取请求数据（支持 JSON 和 form-data）
+        # 支持通过环境变量设置默认值
         if request.is_json:
             data = request.json
+            print("--------------------------------")
+            print(f"data: {data}")
+            print("--------------------------------")
             base64_str = data.get('image_base64')
-            text_prompt = data.get('text_prompt', 'road surface.')
-            box_threshold = float(data.get('box_threshold', 0.01))
-            text_threshold = float(data.get('text_threshold', 0.25))
-            epsilon = float(data.get('epsilon', 1.0))
+            text_prompt = data.get('text_prompt', os.getenv('DEFAULT_TEXT_PROMPT', 'road surface.'))
+            box_threshold = float(data.get('box_threshold', os.getenv('DEFAULT_BOX_THRESHOLD', '0.1')))
+            text_threshold = float(data.get('text_threshold', os.getenv('DEFAULT_TEXT_THRESHOLD', '0.25')))
+            epsilon = float(data.get('epsilon', os.getenv('DEFAULT_EPSILON', '1.0')))
         else:
             base64_str = request.form.get('image_base64')
-            text_prompt = request.form.get('text_prompt', 'road surface.')
-            box_threshold = float(request.form.get('box_threshold', 0.01))
-            text_threshold = float(request.form.get('text_threshold', 0.25))
-            epsilon = float(request.form.get('epsilon', 1.0))
+            text_prompt = request.form.get('text_prompt', os.getenv('DEFAULT_TEXT_PROMPT', 'road surface.'))
+            box_threshold = float(request.form.get('box_threshold', os.getenv('DEFAULT_BOX_THRESHOLD', '0.1')))
+            text_threshold = float(request.form.get('text_threshold', os.getenv('DEFAULT_TEXT_THRESHOLD', '0.25')))
+            epsilon = float(request.form.get('epsilon', os.getenv('DEFAULT_EPSILON', '1.0')))
         
         # 记录请求参数
         base64_len = len(base64_str) if base64_str else 0
@@ -199,12 +252,27 @@ def inference():
             f"epsilon={epsilon} | "
             f"base64_length={base64_len}"
         )
+
+        
         
         # 验证 base64 输入
         if not base64_str:
             logger.warning(f"[{request_id}] ⚠️ 缺少image_base64参数")
             return jsonify({"error": "请提供 image_base64 参数（Base64 编码的图像数据）", "request_id": request_id}), 400
+
+       
         
+        # # 保存参数到文件
+        # save_request_params(
+        #     request_id=request_id,
+        #     text_prompt=text_prompt,
+        #     box_threshold=box_threshold,
+        #     text_threshold=text_threshold,
+        #     epsilon=epsilon,
+        #     base64_str=base64_str
+        # )
+          
+
         # 记录推理开始
         inference_start = time.time()
         logger.info(f"[{request_id}] 🚀 开始推理 | PID={os.getpid()} | TID={threading.current_thread().ident}")
@@ -252,6 +320,33 @@ def stats():
         stats_copy = _request_stats.copy()
     stats_copy.pop('lock', None)  # 移除锁对象
     return jsonify(stats_copy)
+
+@app.route('/pool-metrics', methods=['GET'])
+def pool_metrics():
+    """线程池监控接口"""
+    try:
+        from pool_metrics import get_metrics
+        from thread_pool_manager import get_thread_pool_manager
+        from pool_config import get_pool_config
+        
+        metrics = get_metrics()
+        pool_stats = get_thread_pool_manager().get_stats()
+        config = get_pool_config()
+        
+        return jsonify({
+            "thread_pool_enabled": config.enable_thread_pool,
+            "metrics": metrics.get_metrics(),
+            "pool_stats": pool_stats,
+            "config": {
+                "decode_threads": config.decode_threads,
+                "preprocess_threads": config.preprocess_threads,
+                "decode_queue_maxsize": config.decode_queue_maxsize,
+                "inference_queue_maxsize": config.inference_queue_maxsize
+            }
+        })
+    except Exception as e:
+        logger.error(f"获取线程池指标失败: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/metrics', methods=['GET'])
 def metrics():
