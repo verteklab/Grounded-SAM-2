@@ -294,20 +294,46 @@ def extract_mask_contour_from_box(mask, box):
     从全图 mask 中提取框内区域的轮廓（框局部坐标系）
     
     Args:
-        mask: 全图尺寸的布尔 mask (H, W)
-        box: 边界框 (x1, y1, x2, y2) 原图坐标系
+        mask: 全图尺寸的布尔 mask (H, W)，numpy.ndarray
+        box: 边界框 (x1, y1, x2, y2) 原图坐标系，numpy.ndarray 或 list/tuple
     
     Returns:
         tuple: (contours, actual_box) 
             - contours: 轮廓列表，每个轮廓是 (N, 2) 的数组，坐标在框局部坐标系
             - actual_box: 实际裁剪区域的边界框 (x1, y1, x2, y2)，在图像范围内
     """
+    # 类型检查：确保 mask 是 numpy.ndarray
+    if not isinstance(mask, np.ndarray):
+        raise TypeError(f"mask 只支持 numpy.ndarray，收到类型: {type(mask)}")
+    
+    # 确保 mask 是 2 维数组
+    if mask.ndim != 2:
+        if mask.ndim == 3:
+            mask = mask.squeeze(0)
+        else:
+            raise ValueError(
+                f"mask 应该是2维数组 (H, W)，但得到 {mask.ndim} 维，形状: {mask.shape}"
+            )
+    
+    # box 也转成 numpy
+    if not isinstance(box, np.ndarray):
+        box = np.array(box)
     x1, y1, x2, y2 = box.astype(int)
-    x1_actual, y1_actual = max(0, x1), max(0, y1)
-    x2_actual, y2_actual = min(mask.shape[1], x2), min(mask.shape[0], y2)
+    
+    # 确保坐标在有效范围内（与convert.py保持一致）
+    mask_h, mask_w = mask.shape
+    x1_actual = max(0, min(x1, mask_w - 1))
+    y1_actual = max(0, min(y1, mask_h - 1))
+    x2_actual = max(x1_actual + 1, min(x2, mask_w))
+    y2_actual = max(y1_actual + 1, min(y2, mask_h))
+    
     actual_box = np.array([x1_actual, y1_actual, x2_actual, y2_actual])
     
-    # 裁剪到框内区域
+    # 检查裁剪区域是否有效
+    if x2_actual <= x1_actual or y2_actual <= y1_actual:
+        return [], actual_box
+    
+    # 裁剪到框内区域（注意：mask 索引是 [y, x] 顺序）
     box_mask = mask[y1_actual:y2_actual, x1_actual:x2_actual].astype(np.uint8) * 255
     
     # 如果框内没有 mask，返回空列表
@@ -337,11 +363,30 @@ def simplify_polygon(contour, epsilon=2.0):
     Returns:
         simplified_contour: 简化后的轮廓点 (M, 2)，M <= N
     """
+    # 类型检查和维度处理（与convert.py保持一致）
+    if not isinstance(contour, np.ndarray):
+        contour = np.array(contour)
+    
     if len(contour) < 3:
         return contour
     
+    # 确保 (N, 2) 格式
+    if contour.ndim == 1:
+        if len(contour) == 2:
+            contour = contour.reshape(1, 2)
+        else:
+            raise ValueError(f"contour 形状无效: {contour.shape}")
+    elif contour.ndim == 2:
+        if contour.shape[1] != 2:
+            raise ValueError(
+                f"contour 应该是 (N, 2) 形状，但得到 {contour.shape}"
+            )
+    else:
+        raise ValueError(f"contour 应该是2维数组，但得到 {contour.ndim} 维")
+    
     # 确保轮廓点是整数类型（OpenCV 要求）
     contour_int = contour.astype(np.int32)
+    
     # 确保是 (N, 1, 2) 格式，OpenCV 标准格式
     if contour_int.ndim == 2:
         contour_int = contour_int.reshape(-1, 1, 2)
@@ -350,6 +395,10 @@ def simplify_polygon(contour, epsilon=2.0):
     # epsilon 参数控制简化程度
     epsilon_val = epsilon * cv2.arcLength(contour_int, closed=True) / 100.0
     simplified = cv2.approxPolyDP(contour_int, epsilon_val, closed=True)
+    
+    # 检查简化结果是否为空
+    if simplified.shape[0] == 0:
+        return contour
     
     # 转换回 (M, 2) 格式并返回浮点类型
     return simplified.reshape(-1, 2).astype(float)

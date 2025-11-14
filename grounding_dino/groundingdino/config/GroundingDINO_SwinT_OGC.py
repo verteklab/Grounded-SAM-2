@@ -31,7 +31,13 @@ dn_bbox_coef = 1.0
 embed_init_tgt = True
 dn_labelbook_size = 2000
 max_text_len = 256
-text_encoder_type = "/home/baiqiliu/Grounded-SAM-2/test_GSAM/bert-base-uncased-local"
+# text_encoder_type 支持环境变量覆盖，默认使用容器内的本地模型路径
+# 如果环境变量 BERT_MODEL_PATH 未设置，则使用容器内路径
+import os
+text_encoder_type = os.getenv("BERT_MODEL_PATH", "/app/flask-server/bert-base-uncased-local")
+# 如果容器内路径不存在，回退到标准模型名称（会从 TRANSFORMERS_CACHE 或在线下载）
+if not os.path.exists(text_encoder_type):
+    text_encoder_type = "bert-base-uncased"
 use_text_enhancer = True
 use_fusion_layer = True
 use_checkpoint = True

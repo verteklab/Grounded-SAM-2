@@ -1,0 +1,175 @@
+# ================== Stage 1: 构建依赖 ==================
+FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime AS builder
+
+# 配置 apt 使用国内源（阿里云镜像）
+RUN sed -i 's|http://archive.ubuntu.com|https://mirrors.aliyun.com|g' /etc/apt/sources.list.d/*.list 2>/dev/null || true && \
+    sed -i 's|http://security.ubuntu.com|https://mirrors.aliyun.com|g' /etc/apt/sources.list.d/*.list 2>/dev/null || true
+
+# 安装构建 Python 包所需的系统依赖（含 ffmpeg 等）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    libavutil-dev \
+    libavcodec-dev \
+    libavformat-dev \
+    libswscale-dev \
+    pkg-config \
+    build-essential \
+    libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# 配置 pip 使用国内源（清华镜像）
+RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple && \
+    pip config set global.trusted-host pypi.tuna.tsinghua.edu.cn
+
+# 使用虚拟环境，便于在最终镜像中整体复制
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# 升级 pip / setuptools，避免版本过老带来的构建问题
+RUN pip install --upgrade pip "setuptools>=62.3.0,<75.9" wheel
+
+# 先复制用于安装依赖的最小文件集（便于缓存）
+COPY pyproject.toml setup.py MANIFEST.in README.md /app/
+COPY grounding_dino/ /app/grounding_dino/
+COPY sam2/ /app/sam2/
+
+# 安装通用 Python 依赖
+RUN pip install --no-cache-dir \
+    flask \
+    gunicorn \
+    psutil \
+    requests \
+    numpy \
+    opencv-python \
+    pillow \
+    transformers \
+    supervision \
+    pycocotools \
+    addict \
+    yapf \
+    timm \
+    tqdm \
+    hydra-core \
+    iopath
+
+# SAM2 构建相关环境变量（如果只在构建阶段需要，可以留在这里）
+ENV SAM2_BUILD_CUDA=1 \
+    SAM2_BUILD_ALLOW_ERRORS=1
+
+# 安装 GroundingDINO 与项目本身（非 editable，更适合生产）
+RUN pip install --no-cache-dir --no-build-isolation /app/grounding_dino && \
+    pip install --no-cache-dir /app/
+
+
+# ================== Stage 2: 运行镜像 ==================
+FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
+
+# 配置 apt 使用国内源（阿里云镜像）
+RUN sed -i 's|http://archive.ubuntu.com|https://mirrors.aliyun.com|g' /etc/apt/sources.list.d/*.list 2>/dev/null || true && \
+    sed -i 's|http://security.ubuntu.com|https://mirrors.aliyun.com|g' /etc/apt/sources.list.d/*.list 2>/dev/null || true
+
+# 安装运行时系统依赖（不再安装 build-essential 等编译工具）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    libavutil-dev \
+    libavcodec-dev \
+    libavformat-dev \
+    libswscale-dev \
+    pkg-config \
+    libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# 基础环境变量
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    PROJECT_ROOT=/app
+
+# Gunicorn 配置（可通过环境变量覆盖）
+ENV GUNICORN_WORKERS=4 \
+    GUNICORN_THREADS=3 \
+    GUNICORN_TIMEOUT=300 \
+    GUNICORN_BIND=0.0.0.0:6155 \
+    GUNICORN_DAEMON=False \
+    GUNICORN_MAX_REQUESTS=0 \
+    GUNICORN_MAX_REQUESTS_JITTER=0 \
+    GUNICORN_GRACEFUL_TIMEOUT=60 \
+    GUNICORN_LOGLEVEL=info \
+    GPU_DEVICE_ID=2
+
+# 线程池配置（可通过环境变量覆盖）
+ENV ENABLE_THREAD_POOL=true \
+    DECODE_THREADS=2 \
+    PREPROCESS_THREADS=1 \
+    POSTPROCESS_THREADS=1 \
+    GPU_WORKER_THREADS=1 \
+    MAX_TOTAL_THREADS=8 \
+    DECODE_QUEUE_MAXSIZE=100 \
+    INFERENCE_QUEUE_MAXSIZE=50 \
+    ENABLE_AUTO_SCALING=true \
+    SCALE_UP_THRESHOLD=10 \
+    SCALE_DOWN_THRESHOLD=2 \
+    SCALE_DOWN_IDLE_SECONDS=60 \
+    TASK_TIMEOUT=300.0 \
+    QUEUE_WAIT_TIMEOUT=5.0 \
+    METRICS_COLLECTION_INTERVAL=5.0
+
+# API 默认参数
+ENV DEFAULT_TEXT_PROMPT="road surface." \
+    DEFAULT_BOX_THRESHOLD=0.1 \
+    DEFAULT_TEXT_THRESHOLD=0.25 \
+    DEFAULT_EPSILON=1.0
+
+# 模型路径配置（volume 挂载）
+ENV SAM2_CHECKPOINT_PATH=/data/checkpoints/sam2.1_hiera_large.pt \
+    SAM2_CONFIG_NAME=configs/sam2.1/sam2.1_hiera_l.yaml \
+    GDINO_CHECKPOINT_PATH=/data/gdino_checkpoints/groundingdino_swint_ogc.pth \
+    GDINO_CONFIG_PATH=/app/grounding_dino/groundingdino/config/GroundingDINO_SwinT_OGC.py
+
+# Hugging Face 模型路径配置（通过 volume 挂载）
+ENV TRANSFORMERS_CACHE=/data/hf_models \
+    HF_HOME=/data/hf_models \
+    TRANSFORMERS_OFFLINE=1 \
+    HF_HUB_OFFLINE=1
+
+# 日志配置
+ENV LOG_DIR=/app/flask-server/logs \
+    LOG_LEVEL=INFO \
+    LOG_MAX_BYTES=10485760 \
+    LOG_BACKUP_COUNT=5 \
+    RESULTS_DIR=/app/flask-server/results
+
+# 从 builder 拷贝已经安装好的虚拟环境
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# 复制 Flask 应用代码（包含 model_manager.py）
+COPY flask-server/ /app/flask-server/
+
+# （可选）如果运行时需要访问源码中的配置文件，可以仅复制必要部分
+COPY grounding_dino/ /app/grounding_dino/
+COPY sam2/ /app/sam2/
+COPY pyproject.toml setup.py MANIFEST.in README.md /app/
+
+# 创建挂载点目录（模型权重和 HF 模型通过 volume 挂载）
+RUN mkdir -p /data/checkpoints \
+    /data/gdino_checkpoints \
+    /data/hf_models \
+    /app/flask-server/logs \
+    /app/flask-server/results
+
+# 设置工作目录为 flask-server
+WORKDIR /app/flask-server
+
+# 暴露端口
+EXPOSE 6155
+
+# 启动命令
+CMD ["gunicorn", "--config", "config/gunicorn.conf.py", "wsgi:app"]
